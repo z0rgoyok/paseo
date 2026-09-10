@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "files": [
+    "packages/server/src/server/coordination/model.ts",
+    "packages/server/src/server/coordination/graph.ts",
+    "packages/server/src/server/coordination/reducer.ts",
+    "packages/server/src/server/coordination/store.ts",
+    "packages/server/src/server/coordination/context.ts",
+    "packages/server/src/server/coordination/worktree.ts",
+    "packages/server/src/server/coordination/panel.ts"
+  ]
+}
