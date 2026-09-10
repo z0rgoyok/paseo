@@ -33,6 +33,8 @@ export type Operation =
   | { op: "post"; id: string; text: string; priority?: "normal" | "important" | "urgent"; pinned?: boolean; about?: string[]; replyTo?: string; replaces?: string; material?: boolean; references?: string[] }
   | { op: "resolve"; id: string; expectedVersion: number; explanation: string; observed: { id: string; version: number }[] }
   | { op: "ack"; id: string; version: number }
+  | { op: "ack_events"; through: number }
+  | { op: "pause"; agentId: string; paused: boolean }
   | { op: "member"; agentId: string; role: "worker" | "observer"; paused?: boolean }
   | { op: "peers"; pairs: [string, string][] }
   | { op: "handoff"; leader: string; expectedEpoch: number };

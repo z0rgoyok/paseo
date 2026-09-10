@@ -9,7 +9,11 @@ export function invalidate(team: Team, source: string): string[] {
   const origin = team.entities[source];
   for (let i = 0; i < queue.length; i++) {
     for (const entity of Object.values(team.entities)) {
-      if (visited.has(entity.id) || !entity.refs.some(ref => ref.id === queue[i] && invalidating.has(ref.relation) && (queue[i] !== source || ref.version < origin.version))) continue;
+      const explicit = entity.refs.some(ref => ref.id === queue[i] && invalidating.has(ref.relation) && (queue[i] !== source || ref.version < origin.version));
+      const changedTask = team.entities[queue[i]];
+      const structural = changedTask?.kind === "task" && entity.kind === "task" &&
+        (changedTask.data.parent === entity.id || (["active", "done"].includes(String(entity.data.status)) && deps(team, entity).includes(changedTask.id)));
+      if (visited.has(entity.id) || (!explicit && !structural)) continue;
       entity.stale = [...entity.stale.filter(reason => reason.source !== source), { source, version: origin.version, revision: team.revision }];
       visited.add(entity.id); queue.push(entity.id); affected.push(entity.id);
     }
@@ -87,7 +91,7 @@ export function stateProjection(team: Team): Record<string, unknown> {
   const entities = Object.values(team.entities);
   const tasks = entities.filter(e => e.kind === "task");
   function node(e: Entity): unknown {
-    return { id: e.id, ...e.data, version: e.version, freshness: e.stale.length ? "needs_reconsideration" : "current", stale: e.stale,
+    return { ...e.data, id: e.id, version: e.version, freshness: e.stale.length ? "needs_reconsideration" : "current", stale: e.stale,
       readiness: taskReadiness(team, e), children: tasks.filter(t => t.data.parent === e.id).map(node) };
   }
   return { revision: team.revision, epoch: team.epoch, leader: team.leader,
