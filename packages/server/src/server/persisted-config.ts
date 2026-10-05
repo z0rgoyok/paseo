@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { HandoffConfigSchema } from "./handoff/contract.js";
 
 import {
   AgentProviderRuntimeSettingsMapSchema,
@@ -233,6 +234,7 @@ export const PersistedConfigSchema = z
     // v1 config layout
     daemon: z
       .object({
+        handoff: HandoffConfigSchema.optional(),
         listen: z.string().optional(),
         hostnames: z.union([z.literal(true), z.array(z.string())]).optional(),
         allowedHosts: z.union([z.literal(true), z.array(z.string())]).optional(),

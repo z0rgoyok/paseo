@@ -3,7 +3,7 @@ import express from "express";
 import { createServer as createHTTPServer, type IncomingMessage, type ServerResponse } from "http";
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, rm, stat } from "fs/promises";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { hostname as getHostname } from "node:os";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -129,7 +129,9 @@ import type { OpenAiSpeechProviderConfig } from "./speech/providers/openai/confi
 import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.js";
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
-import { AgentManager } from "./agent/agent-manager.js";
+import { AgentManager, type AgentManagerOptions } from "./agent/agent-manager.js";
+import { createHandoffIngress } from "./handoff/execution.js";
+import type { HandoffConfig } from "./handoff/contract.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
@@ -386,6 +388,10 @@ export type DaemonLifecycleIntent =
     };
 
 export interface PaseoDaemonConfig {
+  handoff?: HandoffConfig;
+  handoffToken?: string;
+  /** Isolated review harnesses can keep every service credential in memory. */
+  persistLocalCredential?: boolean;
   listen: string;
   paseoHome: string;
   daemonVersion?: string;
@@ -476,6 +482,7 @@ export interface PaseoDaemon {
 }
 
 export interface PaseoDaemonDependencies {
+  verifyTaskReceipt?: AgentManagerOptions["verifyTaskReceipt"];
   hubRelationshipRemote?: HubRelationshipRemote;
   hubRelationshipClock?: HubRelationshipClock;
   hubRelationshipRetryPolicy?: HubRelationshipRetryPolicy;
@@ -930,6 +937,7 @@ export async function createPaseoDaemon(
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
+    verifyTaskReceipt: dependencies.verifyTaskReceipt,
     appendSystemPrompt: config.appendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
@@ -1179,6 +1187,12 @@ export async function createPaseoDaemon(
   };
   const createAgent = (input: Parameters<typeof createAgentCommand>[1]) =>
     createAgentCommand(createAgentCommandDependencies, input);
+  const handoff = createHandoffIngress(app, config, {
+    agentManager,
+    agentStorage,
+    logger,
+    ensureWorkspace: ensureWorkspaceForCreateAndBroadcastExternal,
+  });
   const archiveWorkspaceByIdExternal = (workspaceId: string, requestId: string) =>
     archiveByScope(
       {
@@ -1579,7 +1593,10 @@ export async function createPaseoDaemon(
   const start = async () => {
     let mainStarted = false;
     try {
-      localCredential = await writeLocalCredential(config.paseoHome);
+      localCredential =
+        config.persistLocalCredential === false
+          ? randomBytes(32).toString("base64url")
+          : await writeLocalCredential(config.paseoHome);
       if (serviceProxyListenTarget) {
         const boundServiceProxyTarget = await serviceProxy.startStandalone({
           listenTarget: serviceProxyListenTarget,
@@ -1627,6 +1644,11 @@ export async function createPaseoDaemon(
               agentManager.setAppendSystemPrompt(typeof value === "string" ? value : "");
             });
             const relayEnabled = config.relayEnabled ?? true;
+            void agentManager.recoverManagedGoalContinuations().catch(() => {
+              logger.error(
+                "Persistent goal recovery held; inspect goal readback before continuing",
+              );
+            });
             const relayEndpoint = config.relayEndpoint ?? "relay.paseo.sh:443";
             const relayPublicEndpoint = config.relayPublicEndpoint ?? relayEndpoint;
             const relayUseTls = config.relayUseTls ?? relayEndpoint === "relay.paseo.sh:443";
@@ -1769,6 +1791,7 @@ export async function createPaseoDaemon(
       // model loading doesn't block the server from accepting connections.
       speechService.start();
       scriptHealthMonitor.start();
+      await handoff?.recover();
     } catch (error) {
       localCredential = null;
       await deleteLocalCredential(config.paseoHome);
@@ -1785,6 +1808,7 @@ export async function createPaseoDaemon(
   };
 
   const stop = async () => {
+    await handoff?.stop();
     localCredential = null;
     await deleteLocalCredential(config.paseoHome);
     // Stop tracking plugin provider registrations before anything tears plugins

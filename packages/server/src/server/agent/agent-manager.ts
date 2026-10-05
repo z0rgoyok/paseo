@@ -3,6 +3,16 @@ import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
+import { ManagedGoalStore, type ManagedGoal } from "./managed-goal.js";
+import {
+  AgentReceiptLedger,
+  validateAgentReceipt,
+  verifyReviewArtifact,
+  type AgentReceipt,
+} from "./agent-receipt.js";
+import { verifyTaskReceiptReadback } from "./task-receipt-readback.js";
+import { mapReceiptState, type ReceiptRuntimeFacts } from "./receipt-state.js";
+import { createHash } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import {
@@ -119,6 +129,22 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .join("\n")
     .trim();
 }
+
+function resolveGoalServices(options: AgentManagerOptions) {
+  const goals =
+    options.managedGoalStore ??
+    (options.registry
+      ? new ManagedGoalStore(options.registry.getManagedGoalDirectory())
+      : undefined);
+  return {
+    goals,
+    receipts: goals ? new AgentReceiptLedger(resolve(goals.directory, "receipts")) : undefined,
+    requireGoals: options.requireGoals ?? Boolean(process.env.PASEO_TICH_MCP_COMMAND),
+    verifyTaskReceipt: options.verifyTaskReceipt ?? verifyTaskReceiptReadback,
+  };
+}
+
+type RegisteredGoal = NonNullable<Awaited<ReturnType<AgentManager["getAgentGoal"]>>>;
 
 export class AgentManagerShuttingDownError extends Error {
   constructor() {
@@ -318,6 +344,10 @@ export interface CreateAgentOptions {
 }
 
 export interface AgentManagerOptions {
+  receiptRuntimeFacts?: (agentId: string) => ReceiptRuntimeFacts;
+  verifyTaskReceipt?: (receipt: AgentReceipt, labels: Record<string, string>) => Promise<unknown>;
+  managedGoalStore?: ManagedGoalStore;
+  requireGoals?: boolean;
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -718,6 +748,14 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
 }
 
 export class AgentManager {
+  private readonly managedGoals?: ManagedGoalStore;
+  private readonly requireGoals: boolean;
+  private readonly goalContinuations = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly managedGoalActors = new Set<string>();
+  private readonly receiptLedger?: AgentReceiptLedger;
+  private readonly verifyTaskReceipt: NonNullable<AgentManagerOptions["verifyTaskReceipt"]>;
+  private readonly receiptRuntimeFacts?: AgentManagerOptions["receiptRuntimeFacts"];
+  private activeGoalContinuations = 0;
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
@@ -762,6 +800,12 @@ export class AgentManager {
     this.pluginLifecycle = options.pluginLifecycle;
     this.idFactory = options?.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
+    const goalServices = resolveGoalServices(options);
+    this.managedGoals = goalServices.goals;
+    this.receiptLedger = goalServices.receipts;
+    this.verifyTaskReceipt = goalServices.verifyTaskReceipt;
+    this.receiptRuntimeFacts = options.receiptRuntimeFacts;
+    this.requireGoals = goalServices.requireGoals;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
@@ -853,6 +897,7 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    for (const id of this.goalContinuations.keys()) this.clearGoalContinuation(id);
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -2312,6 +2357,312 @@ export class AgentManager {
     return agent.session.getNativeGoal();
   }
 
+  async getAgentGoal(agentId: string) {
+    const agent = this.requireSessionAgent(agentId);
+    if (agent.session.getNativeGoal) return agent.session.getNativeGoal();
+    if (!this.managedGoals) throw new Error("Persistent manager goal storage unavailable");
+    const goal = await this.managedGoals.get(agentId);
+    if (goal) this.managedGoalActors.add(agentId);
+    return goal;
+  }
+
+  async setAgentGoal(
+    agentId: string,
+    objective: string,
+    tokenBudget: number | null = null,
+    maxTurns = 128,
+  ) {
+    const agent = this.requireSessionAgent(agentId);
+    if (agent.session.setNativeGoal)
+      return agent.session.setNativeGoal({ objective, status: "active", tokenBudget });
+    if (agent.session.getNativeGoal)
+      throw new Error("Native goal setter unavailable; use supported native goal command");
+    if (!this.managedGoals) throw new Error("Persistent manager goal storage unavailable");
+    const goal = await this.managedGoals.set(agentId, objective, tokenBudget, maxTurns);
+    this.managedGoalActors.add(agentId);
+    return goal;
+  }
+
+  async controlAgentGoal(
+    agentId: string,
+    status: "active" | "paused" | "cancelled" | "blocked",
+    acknowledgeUnknown = false,
+  ) {
+    const agent = this.requireSessionAgent(agentId);
+    if (status === "blocked") {
+      const facts = this.receiptRuntimeFacts?.(agentId);
+      if (!facts?.unfixableInfraBlocker && !facts?.productDecisionRequired) {
+        // A model's internal wait is not an owner-facing blocker.
+        return this.getAgentGoal(agentId);
+      }
+    }
+    let goal;
+    if (agent.session.setNativeGoal) {
+      goal = await agent.session.setNativeGoal({
+        status: status === "cancelled" ? "paused" : status,
+      });
+    } else {
+      if (!this.managedGoals) throw new Error("Persistent manager goal storage unavailable");
+      goal = await this.managedGoals.control(agentId, status, acknowledgeUnknown);
+    }
+    if (status !== "active") {
+      this.clearGoalContinuation(agentId);
+      await this.cancelAgentRun(agentId);
+    } else if (goal && "engine" in goal) this.scheduleGoalContinuation(agentId);
+    return goal;
+  }
+
+  async completeAgentGoal(agentId: string, goalId: string, evidencePath: string, sha256: string) {
+    const agent = this.requireSessionAgent(agentId);
+    if (agent.session.getNativeGoal)
+      throw new Error("Complete native goals through the provider's supported goal tool");
+    if (!this.managedGoals) throw new Error("Persistent manager goal storage unavailable");
+    const goal = await this.managedGoals.complete(agentId, goalId, agent.cwd, evidencePath, sha256);
+    this.clearGoalContinuation(agentId);
+    return goal;
+  }
+
+  async submitAgentReceipt(agentId: string, input: unknown) {
+    const agent = this.requireSessionAgent(agentId),
+      receipt = validateAgentReceipt(input);
+    const goal = await this.getAgentGoal(agentId);
+    if (!goal || !this.receiptLedger)
+      throw new Error("Receipt requires registered persistent goal and durable ledger");
+    const binding =
+      "goalId" in goal
+        ? goal.goalId
+        : createHash("sha256")
+            .update(JSON.stringify([goal.threadId, goal.createdAt, goal.objective]))
+            .digest("hex");
+    const parentId = getParentAgentIdFromLabels(agent.labels);
+    const parent = parentId
+      ? (this.agents.get(parentId) ?? (await this.registry?.get(parentId)))
+      : undefined;
+    const labels = { ...parent?.labels, ...agent.labels };
+    const checked =
+      receipt.receipt_type === "review_completed"
+        ? await verifyReviewArtifact(agent.cwd, receipt)
+        : receipt;
+    return this.receiptLedger.submit(agentId, binding, checked, async (payload) => {
+      const tracker = await this.verifyTaskReceipt(payload, labels);
+      const facts = this.getReceiptRuntimeFacts(agentId, labels);
+      const state = mapReceiptState(payload, facts);
+      const nextGoal = await this.applyReceiptToGoal(agent, goal, payload, state);
+      return { goal: nextGoal, tracker, mapping: state };
+    });
+  }
+
+  private getReceiptRuntimeFacts(
+    agentId: string,
+    labels: Record<string, string>,
+  ): ReceiptRuntimeFacts {
+    return (
+      this.receiptRuntimeFacts?.(agentId) ?? {
+        reviewerAssigned: Array.from(this.agents.values()).some(
+          (child) =>
+            getParentAgentIdFromLabels(child.labels) === agentId &&
+            child.labels.role === "reviewer",
+        ),
+        probeRouteAvailable: labels["paseo.probe-route"] === "available",
+        backlogDecisionAccepted: labels["paseo.backlog-decision"] === "accepted",
+        unfixableInfraBlocker: labels["paseo.infra-blocker"] === "unfixable",
+        productDecisionRequired: labels["paseo.product-decision"] === "required",
+      }
+    );
+  }
+
+  private async applyReceiptToGoal(
+    agent: ActiveManagedAgent,
+    goal: RegisteredGoal,
+    payload: AgentReceipt,
+    state: ReturnType<typeof mapReceiptState>,
+  ): Promise<RegisteredGoal> {
+    let nextGoal = goal;
+    if (payload.receipt_type === "review_completed")
+      nextGoal = await this.completeReviewReceipt(agent, goal, payload, state.escalateOwner);
+    if (payload.receipt_type === "task_state" && payload.status === "done")
+      nextGoal = await this.completeTaskReceipt(agent, goal, payload);
+    if (state.continueLead && payload.receipt_type === "task_state")
+      nextGoal = await this.continueGoalFromReceipt(agent, nextGoal);
+    return nextGoal;
+  }
+
+  private async completeReviewReceipt(
+    agent: ActiveManagedAgent,
+    goal: RegisteredGoal,
+    payload: AgentReceipt,
+    escalateOwner: boolean,
+  ): Promise<RegisteredGoal> {
+    this.clearGoalContinuation(agent.id);
+    if ("goalId" in goal) {
+      let finalStatus: "complete" | "blocked" | "held" = "complete";
+      if (payload.verdict === "blocked") finalStatus = escalateOwner ? "blocked" : "held";
+      return this.managedGoals!.complete(
+        agent.id,
+        goal.goalId,
+        agent.cwd,
+        payload.review_artifact!.path,
+        payload.review_artifact!.sha256,
+        finalStatus,
+      );
+    }
+    if (payload.verdict !== "blocked" && goal.status === "active" && agent.session.setNativeGoal)
+      return (await agent.session.setNativeGoal({ status: "complete" })) ?? goal;
+    return goal;
+  }
+
+  private async completeTaskReceipt(
+    agent: ActiveManagedAgent,
+    goal: RegisteredGoal,
+    payload: AgentReceipt,
+  ): Promise<RegisteredGoal> {
+    if (!["team-lead", "lead"].includes(agent.labels.role ?? ""))
+      throw new Error("Whole-task done receipt belongs to its responsible lead");
+    this.clearGoalContinuation(agent.id);
+    if (agent.session.setNativeGoal && goal.status === "active")
+      return (await agent.session.setNativeGoal({ status: "complete" })) ?? goal;
+    if ("goalId" in goal)
+      return this.managedGoals!.completeAcceptedTask(agent.id, payload.completion_comment!);
+    return goal;
+  }
+
+  private async continueGoalFromReceipt(
+    agent: ActiveManagedAgent,
+    goal: RegisteredGoal,
+  ): Promise<RegisteredGoal> {
+    if (["paused", "cancelled", "complete", "budgetLimited", "usageLimited"].includes(goal.status))
+      return goal;
+    if (agent.session.setNativeGoal)
+      return (await agent.session.setNativeGoal({ status: "active" })) ?? goal;
+    if (!this.managedGoals || ("lease" in goal && goal.lease)) return goal;
+    const continued = await this.managedGoals.control(agent.id, "active");
+    this.scheduleGoalContinuation(agent.id);
+    return continued;
+  }
+
+  async finishAgentGoalFromReceipt(agentId: string, receiptId: string) {
+    const agent = this.requireSessionAgent(agentId),
+      goal = await this.getAgentGoal(agentId);
+    const record = await this.receiptLedger?.get(receiptId);
+    if (!goal || !record || record.agent_id !== agentId || record.status !== "processed")
+      throw new Error("Processed actor receipt required");
+    const binding =
+      "goalId" in goal
+        ? goal.goalId
+        : createHash("sha256")
+            .update(JSON.stringify([goal.threadId, goal.createdAt, goal.objective]))
+            .digest("hex");
+    if (record.goal_binding !== binding) throw new Error("Actor result goal binding mismatch");
+    if (goal.status === "complete") return goal;
+    if (goal.status !== "active") throw new Error("Owner hold/resource ceiling preserved");
+    this.clearGoalContinuation(agentId);
+    if (agent.session.setNativeGoal) return agent.session.setNativeGoal({ status: "complete" });
+    return this.managedGoals!.finishAcceptedActor(agentId, receiptId);
+  }
+
+  private clearGoalContinuation(id: string): void {
+    const timer = this.goalContinuations.get(id);
+    if (timer) clearTimeout(timer);
+    this.goalContinuations.delete(id);
+  }
+
+  private async reconcileHeldGoal(
+    id: string,
+    goal: ManagedGoal | null,
+    agent: ActiveManagedAgent | undefined,
+  ): Promise<ManagedGoal | null> {
+    if (
+      !goal ||
+      goal.status !== "active" ||
+      goal.phase !== "held" ||
+      !goal.lease ||
+      !agent?.session.getGoalDeliveryOutcome
+    )
+      return goal;
+    const proof = await agent.session.getGoalDeliveryOutcome(goal.lease.id);
+    if (proof.state === "completed")
+      await this.managedGoals!.terminal(
+        id,
+        goal.lease.turnId ?? goal.lease.id,
+        "completed",
+        proof.usage,
+      );
+    else if (proof.state === "not_received")
+      await this.managedGoals!.reconcileAbsentDelivery(id, goal.lease.id);
+    return this.managedGoals!.get(id);
+  }
+
+  private scheduleGoalContinuation(id: string): void {
+    if (!this.managedGoals || this.goalContinuations.has(id) || !this.acceptingAgentRegistrations)
+      return;
+    const timer = setTimeout(() => {
+      this.goalContinuations.delete(id);
+      const task = (async () => {
+        if (!this.acceptingAgentRegistrations) return;
+        if (this.activeGoalContinuations >= 2) {
+          this.scheduleGoalContinuation(id);
+          return;
+        }
+        this.activeGoalContinuations += 1;
+        try {
+          let goal = await this.managedGoals!.get(id);
+          const agent = this.agents.get(id);
+          const record = await this.registry?.get(id);
+          goal = await this.reconcileHeldGoal(id, goal, agent);
+          if (
+            !goal ||
+            goal.status !== "active" ||
+            goal.phase !== "ready" ||
+            !agent ||
+            record?.archivedAt ||
+            agent.activeTurnId ||
+            this.runs.hasRun(id) ||
+            agent.session.getPendingPermissions().length > 0
+          )
+            return;
+          const prompt = `Continue the registered manager goal from its durable checkpoint: ${goal.objective}\nDo not repeat verified work or create duplicate actors. Read the actual goal via get_agent_goal. Submit the common receipt through submit_agent_receipt only when task state changes or your assigned review is complete; reuse the existing take_comment. Review completion requires review_artifact {path,sha256} and verdict. Ordinary model stop submits nothing. Internal reviewer/probe/backlog dependencies keep work in progress; only confirmed unfixable infrastructure or product decisions escalate through the responsible lead. Preserve owner pause/cancel.`;
+          await this.runAgent(id, prompt, {
+            clientMessageId: `goal:${goal.goalId}:${goal.cursor}`,
+          });
+        } finally {
+          this.activeGoalContinuations -= 1;
+        }
+      })();
+      this.backgroundTasks.add(task);
+      void task
+        .catch((error) =>
+          this.logger.warn(
+            { agentId: id, error: error instanceof Error ? error.name : "unknown" },
+            "Manager goal continuation held",
+          ),
+        )
+        .finally(() => this.backgroundTasks.delete(task));
+    }, 1000);
+    timer.unref?.();
+    this.goalContinuations.set(id, timer);
+  }
+
+  async recoverManagedGoalContinuations(): Promise<void> {
+    if (!this.managedGoals || !this.registry) return;
+    for (const id of await this.managedGoals.readyIds(true)) {
+      const record = await this.registry.get(id);
+      if (!record || record.archivedAt || record.internal || !record.persistence) continue;
+      this.managedGoalActors.add(id);
+      if (!this.agents.has(id))
+        await this.resumeAgentFromPersistence(
+          record.persistence,
+          {
+            provider: record.provider,
+            cwd: record.cwd,
+            ...record.config,
+          } as Partial<AgentSessionConfig>,
+          id,
+          { workspaceId: record.workspaceId, labels: record.labels },
+        );
+      this.scheduleGoalContinuation(id);
+    }
+  }
+
   async runAgent(
     agentId: string,
     prompt: AgentPromptInput,
@@ -2360,7 +2711,47 @@ export class AgentManager {
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
     const agent = this.requireSessionAgent(agentId);
-    const handler = agent.session.tryHandleOutOfBand?.(prompt);
+    const providerHandler = agent.session.tryHandleOutOfBand?.(prompt);
+    if (
+      typeof prompt === "string" &&
+      ((!agent.session.getNativeGoal && /^\/goal(?:\s|$)/.test(prompt.trim())) ||
+        /^\/(status|pause|stop|cancel)$/.test(prompt.trim()) ||
+        /^\/goal (status|pause|resume|stop|cancel)$/.test(prompt.trim()) ||
+        (!providerHandler && !agent.session.getNativeGoal && prompt.trim() === "/compact"))
+    ) {
+      const task = (async () => {
+        const text = prompt.trim();
+        const args = text.replace(/^\/goal\s*/, "");
+        let result;
+        if (text === "/status" || text === "/goal" || args === "status")
+          result = await this.getAgentGoal(agentId);
+        else if (text === "/compact")
+          throw new Error(
+            "Provider compact out-of-band capability unavailable; command was not executed as a task",
+          );
+        else if (["/pause", "/goal pause"].includes(text))
+          result = await this.controlAgentGoal(agentId, "paused");
+        else if (["/stop", "/cancel", "/goal stop", "/goal cancel", "/goal clear"].includes(text))
+          result = await this.controlAgentGoal(agentId, "cancelled");
+        else if (args === "resume") result = await this.controlAgentGoal(agentId, "active");
+        else result = await this.setAgentGoal(agentId, args);
+        await this.appendTimelineItem(agentId, {
+          type: "assistant_message",
+          text: JSON.stringify(result),
+        });
+      })();
+      this.backgroundTasks.add(task);
+      void task
+        .catch((error) =>
+          this.appendTimelineItem(agentId, {
+            type: "assistant_message",
+            text: `[Goal] ${error instanceof Error ? error.message : "control failed"}`,
+          }),
+        )
+        .finally(() => this.backgroundTasks.delete(task));
+      return true;
+    }
+    const handler = providerHandler;
     if (!handler) {
       return false;
     }
@@ -2433,6 +2824,34 @@ export class AgentManager {
     });
   }
 
+  private requiresGoalForAgent(agent: ActiveManagedAgent): boolean {
+    return this.requireGoals || agent.labels["paseo.handoff"] === "initial-assignment";
+  }
+
+  private async admitGoalTurn(
+    agent: ActiveManagedAgent,
+    agentId: string,
+    options?: AgentRunOptions,
+  ): Promise<ManagedGoal | null> {
+    if (agent.internal) return null;
+    const required = this.requiresGoalForAgent(agent);
+    if (agent.session.getNativeGoal) {
+      if (required && (await agent.session.getNativeGoal())?.status !== "active")
+        throw new Error("Executable turn requires an actual active native goal");
+      return null;
+    }
+    if (!this.managedGoals) {
+      if (required)
+        throw new Error("Persistent goal capability unavailable; executable turn refused");
+      return null;
+    }
+    const goal = await this.managedGoals.get(agentId);
+    if (!required && !goal) return null;
+    const lease = await this.managedGoals.begin(agentId, options?.clientMessageId ?? randomUUID());
+    this.managedGoalActors.add(agentId);
+    return lease;
+  }
+
   private async startPendingForegroundTurn(params: {
     agent: ActiveManagedAgent;
     agentId: string;
@@ -2441,13 +2860,28 @@ export class AgentManager {
     options?: AgentRunOptions;
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
+    let lease: ManagedGoal | null = null;
     try {
-      const result = await agent.session.startTurn(prompt, options);
+      if (!agent.internal && (this.requiresGoalForAgent(agent) || this.managedGoals))
+        lease = await this.admitGoalTurn(agent, agentId, options);
+      const result = await agent.session.startTurn(
+        prompt,
+        lease?.lease ? { ...options, managerGoalDeliveryId: lease.lease.id } : options,
+      );
+      if (lease?.lease) {
+        try {
+          await this.managedGoals!.accept(agentId, lease.lease.id, result.turnId);
+        } catch (error) {
+          await agent.session.interrupt();
+          throw error;
+        }
+      }
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
       return result.turnId;
     } catch (error) {
+      if (lease) await this.managedGoals!.holdUnknownAdmission(agentId);
       if (pendingRun.settled) {
         throw error;
       }
@@ -4157,6 +4591,25 @@ export class AgentManager {
     );
   }
 
+  private async recordManagedGoalTerminal(
+    agent: ActiveManagedAgent,
+    event: AgentStreamEvent,
+    turnId: string | undefined,
+    disposition: ActiveTurnTerminalDisposition,
+  ): Promise<void> {
+    if (!this.managedGoalActors.has(agent.id) || !this.managedGoals || disposition === "stale")
+      return;
+    let kind: "completed" | "cancelled" | "failed" = "failed";
+    if (event.type === "turn_completed") kind = "completed";
+    if (event.type === "turn_canceled") kind = "cancelled";
+    await this.managedGoals.terminal(
+      agent.id,
+      turnId ?? null,
+      kind,
+      event.type === "turn_completed" ? event.usage : undefined,
+    );
+  }
+
   private async handleStreamEvent(
     agent: ActiveManagedAgent,
     event: AgentStreamEvent,
@@ -4212,10 +4665,17 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
+        if (this.managedGoalActors.has(agent.id))
+          await this.recordManagedGoalTerminal(agent, event, eventTurnId, terminalDisposition);
         this.runs.settleTerminalRun(agent.id, eventTurnId);
         if (isForegroundEvent) {
           this.finalizeForegroundTurn(agent, eventTurnId);
         }
+        if (
+          (event.type === "turn_completed" || event.type === "turn_failed") &&
+          this.managedGoalActors.has(agent.id)
+        )
+          this.scheduleGoalContinuation(agent.id);
       }
 
       if (flags.shouldDispatchEvent) {
@@ -5154,10 +5614,13 @@ export class AgentManager {
     agentId: string,
     options: { env?: Record<string, string>; purpose?: AgentResumePurpose } = {},
   ): Promise<PreparedSessionConfig> {
-    const storedConfig = await this.normalizeConfig(withRuntimeTichMcpServer(stripInternalPaseoMcpServer(config)), {
-      env: options.env,
-      purpose: options.purpose,
-    });
+    const storedConfig = await this.normalizeConfig(
+      withRuntimeTichMcpServer(stripInternalPaseoMcpServer(config)),
+      {
+        env: options.env,
+        purpose: options.purpose,
+      },
+    );
     const paseoToolPolicy = this.paseoToolsEnabled
       ? this.resolvePaseoToolPolicy(storedConfig.provider)
       : { enabled: false };

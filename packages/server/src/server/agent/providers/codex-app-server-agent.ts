@@ -3350,6 +3350,19 @@ interface ConsumedRootCompaction {
   itemId?: string;
 }
 
+function hasConnectedManagedTrackerTools(
+  server: Record<string, unknown> | undefined,
+  tools: Record<string, unknown> | undefined,
+): boolean {
+  return (
+    (server?.runtimeStatus === undefined ||
+      server?.runtimeStatus === null ||
+      server?.runtimeStatus === "connected") &&
+    !server?.toolsError &&
+    Boolean(tools?.list_projects && tools.get_issue_by_number)
+  );
+}
+
 export class CodexAppServerAgentSession implements AgentSession {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -3597,7 +3610,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     const sandbox = toObjectRecord(toObjectRecord(response)?.sandbox);
     if (this.requiresManagedPolicyReadback()) {
       this.managedPolicyVerified = false;
-      if (toObjectRecord(response)?.approvalPolicy !== "never" || sandbox?.type !== "dangerFullAccess") {
+      if (
+        toObjectRecord(response)?.approvalPolicy !== "never" ||
+        sandbox?.type !== "dangerFullAccess"
+      ) {
         throw new Error("Managed Codex native policy readback mismatch; executable turn refused");
       }
       this.managedPolicyVerified = true;
@@ -3608,29 +3624,34 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 
   private requiresManagedPolicyReadback(): boolean {
-    return this.config.mcpServers?.itsaplan?.type === "stdio" &&
+    return (
+      this.config.mcpServers?.itsaplan?.type === "stdio" &&
       this.config.modeId === "full-access" &&
       this.providerOptions.approval_policy === "never" &&
-      this.providerOptions.sandbox_mode === "danger-full-access";
+      this.providerOptions.sandbox_mode === "danger-full-access"
+    );
   }
 
   private async confirmManagedTrackerStartup(): Promise<void> {
     if (this.config.mcpServers?.itsaplan?.type !== "stdio") return;
-    if (!this.client || !this.currentThreadId) throw new Error("Managed Tracker requires initialized native thread");
+    if (!this.client || !this.currentThreadId)
+      throw new Error("Managed Tracker requires initialized native thread");
     for (let attempt = 0; attempt < 20; attempt++) {
       let response: Record<string, unknown> | undefined;
       try {
-        response = toObjectRecord(await this.client.request("mcpServerStatus/list", {
-          threadId: this.currentThreadId, serverName: "itsaplan",
-        }));
+        response = toObjectRecord(
+          await this.client.request("mcpServerStatus/list", {
+            threadId: this.currentThreadId,
+            serverName: "itsaplan",
+          }),
+        );
       } catch {
         throw new Error("Managed Tracker native handshake unavailable; executable turn refused");
       }
       const records = Array.isArray(response?.data) ? response.data : [];
       const server = records.map(toObjectRecord).find((entry) => entry?.name === "itsaplan");
       const tools = toObjectRecord(server?.tools);
-      if ((server?.runtimeStatus === undefined || server?.runtimeStatus === null || server?.runtimeStatus === "connected") && !server?.toolsError &&
-          tools?.list_projects && tools.get_issue_by_number) return;
+      if (hasConnectedManagedTrackerTools(server, tools)) return;
       if (!["notStarted", "starting"].includes(String(server?.runtimeStatus))) break;
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
@@ -4006,8 +4027,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     try {
       const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
-      if (ids.includes(this.currentThreadId) &&
-        (!this.requiresManagedPolicyReadback() || this.managedPolicyVerified)) {
+      if (
+        ids.includes(this.currentThreadId) &&
+        (!this.requiresManagedPolicyReadback() || this.managedPolicyVerified)
+      ) {
         return;
       }
       const response = await this.client.request("thread/resume", params);
@@ -4896,6 +4919,20 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.goalsEnabled) throw new Error("Native goals unavailable in this Codex version");
     await this.connect();
     if (!this.client || !this.currentThreadId) return null;
+    return readNativeGoalSnapshot(this.client, this.currentThreadId);
+  }
+
+  async setNativeGoal(input: {
+    objective?: string;
+    status?: "active" | "paused" | "blocked" | "complete";
+    tokenBudget?: number | null;
+  }): Promise<NativeGoalSnapshot | null> {
+    if (!this.goalsEnabled) throw new Error("Native goals unavailable in this Codex version");
+    await this.connect();
+    if (this.currentThreadId) await this.ensureThreadLoaded();
+    else await this.ensureThread();
+    if (!this.client || !this.currentThreadId) throw new Error("Native goal thread unavailable");
+    await this.client.request("thread/goal/set", { threadId: this.currentThreadId, ...input });
     return readNativeGoalSnapshot(this.client, this.currentThreadId);
   }
 

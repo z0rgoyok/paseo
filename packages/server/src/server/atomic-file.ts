@@ -23,3 +23,28 @@ export async function writeFileAtomic(
 export async function writeJsonFileAtomic(filePath: string, value: unknown): Promise<void> {
   await writeFileAtomic(filePath, JSON.stringify(value, null, 2));
 }
+
+/** Private durable state: file data and the rename are synced before ACK. */
+export async function writeDurableJsonAtomic(filePath: string, value: unknown): Promise<void> {
+  const directory = path.dirname(filePath);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporary = path.join(directory, `.${path.basename(filePath)}.${randomUUID()}.tmp`);
+  try {
+    const fd = await fs.open(temporary, "wx", 0o600);
+    try {
+      await fd.writeFile(JSON.stringify(value));
+      await fd.sync();
+    } finally {
+      await fd.close();
+    }
+    await fs.rename(temporary, filePath);
+    const dir = await fs.open(directory, "r");
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } finally {
+    await fs.unlink(temporary).catch(() => undefined);
+  }
+}

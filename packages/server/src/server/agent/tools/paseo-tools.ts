@@ -8,6 +8,9 @@ import type { AgentManager } from "../agent-manager.js";
 import { AgentProfileSchema } from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../../daemon-config-store.js";
 import { NativeGoalSnapshotSchema } from "../native-goal-readback.js";
+import { ManagedGoalSchema } from "../managed-goal.js";
+import { AgentReceiptJsonSchema } from "../agent-receipt.js";
+import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
 import {
   AgentFeatureSchema,
   AgentPermissionRequestPayloadSchema,
@@ -660,6 +663,16 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       throw new Error(`Parent agent ${callerAgentId} not found`);
     }
     return parentAgent;
+  };
+
+  const authorizeGoalMutation = async (agentId: string) => {
+    if (!callerAgentId || callerAgentId === agentId) return;
+    const target = agentManager.getAgent(agentId) ?? (await agentStorage.get(agentId));
+    if (!target || getParentAgentIdFromLabels(target.labels) !== callerAgentId) {
+      throw new Error(
+        "Goal mutation requires the actor, its responsible lead, or authenticated owner",
+      );
+    }
   };
 
   const resolveInheritedProviderConfig = (
@@ -1991,13 +2004,126 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     },
   );
 
-  registerTool("get_agent_goal", {
-    title: "Read native agent goal", description: "Read actual native goal objective, status, usage and budget.",
-    inputSchema: { agentId: z.string() }, outputSchema: { goal: NativeGoalSnapshotSchema.nullable() },
-  }, async ({ agentId }) => {
-    await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
-    return { content: [], structuredContent: ensureValidJson({ goal: await agentManager.getNativeGoal(agentId) }) };
-  });
+  registerTool(
+    "get_agent_goal",
+    {
+      title: "Read agent goal",
+      description:
+        "Read actual provider native goal or persistent manager goal, including execution status, usage and budget.",
+      inputSchema: { agentId: z.string() },
+      outputSchema: { goal: z.union([NativeGoalSnapshotSchema, ManagedGoalSchema]).nullable() },
+    },
+    async ({ agentId }) => {
+      await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({ goal: await agentManager.getAgentGoal(agentId) }),
+      };
+    },
+  );
+
+  registerTool(
+    "set_agent_goal",
+    {
+      title: "Register persistent agent goal",
+      description:
+        "Register the assigned objective before any executable turn. Does not launch a turn.",
+      inputSchema: {
+        agentId: z.string(),
+        objective: z.string().trim().min(1).max(16000),
+        tokenBudget: z.number().int().positive().nullable().optional(),
+        maxTurns: z.number().int().positive().max(1024).optional(),
+      },
+      outputSchema: { goal: z.union([NativeGoalSnapshotSchema, ManagedGoalSchema]).nullable() },
+    },
+    async ({ agentId, objective, tokenBudget, maxTurns }) => {
+      await authorizeGoalMutation(agentId);
+      await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          goal: await agentManager.setAgentGoal(agentId, objective, tokenBudget ?? null, maxTurns),
+        }),
+      };
+    },
+  );
+
+  registerTool(
+    "update_agent_goal",
+    {
+      title: "Control goal execution",
+      description:
+        "Persist owner pause/cancel or actual blocker before interrupting; explicit resume releases an owner hold. Never substitutes a prompt for active state.",
+      inputSchema: {
+        agentId: z.string(),
+        status: z.enum(["active", "paused", "cancelled", "blocked"]),
+        acknowledgeUnknownDelivery: z.boolean().optional(),
+      },
+      outputSchema: { goal: z.union([NativeGoalSnapshotSchema, ManagedGoalSchema]).nullable() },
+    },
+    async ({ agentId, status, acknowledgeUnknownDelivery }) => {
+      await authorizeGoalMutation(agentId);
+      await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          goal: await agentManager.controlAgentGoal(agentId, status, acknowledgeUnknownDelivery),
+        }),
+      };
+    },
+  );
+
+  registerTool(
+    "submit_agent_receipt",
+    {
+      title: "Submit agent receipt",
+      description:
+        "Submit one common envelope; the hook validates oneOf, runtime task binding, actual Tracker comment and review artifact. Reuse the existing take_comment. Ordinary model stop with no state change submits nothing. Receipt ACK follows durable processing; a review ends only its assigned goal.",
+      inputSchema: {
+        agentId: z.string(),
+        receipt: z.json().describe(JSON.stringify(AgentReceiptJsonSchema)),
+      },
+      outputSchema: {
+        receipt_id: z.string(),
+        agent_id: z.string(),
+        goal_binding: z.string(),
+        receipt: z.json(),
+        status: z.enum(["pending", "processed"]),
+        result: z.json().optional(),
+      },
+    },
+    async ({ agentId, receipt }) => {
+      await authorizeGoalMutation(agentId);
+      await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
+      return {
+        content: [],
+        structuredContent: ensureValidJson(await agentManager.submitAgentReceipt(agentId, receipt)),
+      };
+    },
+  );
+
+  registerTool(
+    "finish_agent_goal",
+    {
+      title: "Accept actor result",
+      description:
+        "Responsible lead/owner accepts a processed actor receipt and completes only that actor's assigned goal. A developer result does not complete the whole Tracker task; explicit owner holds remain.",
+      inputSchema: { agentId: z.string(), receiptId: z.string().regex(/^[a-f0-9]{64}$/) },
+      outputSchema: { goal: z.union([NativeGoalSnapshotSchema, ManagedGoalSchema]).nullable() },
+    },
+    async ({ agentId, receiptId }) => {
+      if (callerAgentId === agentId)
+        throw new Error("Actor result acceptance belongs to its responsible lead/owner");
+      await authorizeGoalMutation(agentId);
+      await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          goal: await agentManager.finishAgentGoalFromReceipt(agentId, receiptId),
+        }),
+      };
+    },
+  );
 
   registerTool(
     "get_agent_status",
