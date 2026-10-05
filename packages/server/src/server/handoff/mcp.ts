@@ -34,7 +34,13 @@ export function mountHandoffMcp(app: Express, service: HandoffService, tokenHash
             openWorldHint: true,
           },
         },
-        async (input) => ({ content: [], structuredContent: await service.assign(input) }),
+        async (input) => {
+          const receipt = await service.assign(input);
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(receipt) }],
+            structuredContent: receipt,
+          };
+        },
       );
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,

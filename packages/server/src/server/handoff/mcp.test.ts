@@ -44,6 +44,10 @@ test("remote assignment catalog is restricted and survives a repeated tool invoc
     const first = await client.callTool({ name: "paseo_assign", arguments: args });
     const repeated = await client.callTool({ name: "paseo_assign", arguments: args });
     expect(first.isError).not.toBe(true);
+    const text = first.content.find((block) => block.type === "text");
+    expect(text?.type).toBe("text");
+    if (text?.type !== "text") throw new Error("Portable receipt text absent");
+    expect(JSON.parse(text.text)).toEqual(first.structuredContent);
     expect(repeated.structuredContent).toEqual(first.structuredContent);
     const outside = await client.callTool({
       name: "paseo_assign",
