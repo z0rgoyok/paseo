@@ -83,6 +83,7 @@ import {
 } from "./rewind.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeConfigDir, claudeProjectDirSync } from "./project-dir.js";
+import { readClaudeGoalDelivery } from "./goal-delivery-readback.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
 import {
   isProviderImageMarkdown,
@@ -2243,6 +2244,11 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     const sdkMessage = this.toSdkUserMessage(prompt);
+    if (options?.managerGoalDeliveryId) {
+      if (!/^[a-f0-9-]{36}$/.test(options.managerGoalDeliveryId))
+        throw new Error("Invalid manager delivery UUID");
+      sdkMessage.uuid = options.managerGoalDeliveryId as typeof sdkMessage.uuid;
+    }
     const sdkUserMessageId =
       typeof sdkMessage.uuid === "string" && sdkMessage.uuid.length > 0 ? sdkMessage.uuid : null;
     this.rememberRewindUserAnchor(sdkUserMessageId);
@@ -2400,6 +2406,27 @@ class ClaudeAgentSession implements AgentSession {
       };
     }
     yield* providerSubagentEvents;
+  }
+
+  async getGoalDeliveryOutcome(deliveryId: string) {
+    if (!this.id) return { state: "unknown" as const };
+    const file = this.resolveHistoryPath(this.id);
+    if (!file) return { state: "unknown" as const };
+    try {
+      const fd = await promises.open(file, "r");
+      try {
+        const info = await fd.stat(),
+          maximum = 16 * 1024 * 1024;
+        const start = Math.max(0, info.size - maximum),
+          buffer = Buffer.alloc(Math.min(info.size, maximum));
+        await fd.read(buffer, 0, buffer.length, start);
+        return readClaudeGoalDelivery(buffer.toString("utf8"), deliveryId, start === 0);
+      } finally {
+        await fd.close();
+      }
+    } catch {
+      return { state: "unknown" as const };
+    }
   }
 
   async getAvailableModes(): Promise<AgentMode[]> {

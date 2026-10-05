@@ -211,6 +211,8 @@ export type AgentPromptContentBlock =
 export type AgentPromptInput = string | AgentPromptContentBlock[];
 
 export interface AgentRunOptions {
+  /** Manager-generated native user UUID, used only for durable delivery reconciliation. */
+  managerGoalDeliveryId?: string;
   outputSchema?: unknown;
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
@@ -676,6 +678,14 @@ export interface AgentSession {
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
   getNativeGoal?(): Promise<NativeGoalSnapshot | null>;
+  setNativeGoal?(input: {
+    objective?: string;
+    status?: "active" | "paused" | "blocked" | "complete";
+    tokenBudget?: number | null;
+  }): Promise<NativeGoalSnapshot | null>;
+  getGoalDeliveryOutcome?(
+    deliveryId: string,
+  ): Promise<{ state: "completed" | "not_received" | "unknown"; usage?: AgentUsage }>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;
   setMode(modeId: string): Promise<void | AgentProviderNotice>;

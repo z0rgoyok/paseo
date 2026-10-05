@@ -116,6 +116,10 @@ export class AgentStorage {
     await this.load();
   }
 
+  getManagedGoalDirectory(): string {
+    return path.join(path.dirname(this.baseDir), "managed-goals");
+  }
+
   async list(): Promise<StoredAgentRecord[]> {
     await this.load();
     return Array.from(this.cache.values());
