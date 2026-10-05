@@ -49,6 +49,8 @@ export const CodexProviderOptionsSchema = z
       .strict()
       .optional(),
     web_search: z.enum(["disabled", "cached", "indexed", "live"]).optional(),
+    model_context_window: z.number().int().positive().optional(),
+    model_auto_compact_token_limit: z.number().int().positive().optional(),
     features: z
       .object({
         network_proxy: z.union([z.boolean(), NetworkPolicySchema]).optional(),

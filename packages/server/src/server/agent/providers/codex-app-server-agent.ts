@@ -1,3 +1,4 @@
+import { readNativeGoalSnapshot, type NativeGoalSnapshot } from "../native-goal-readback.js";
 import {
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
@@ -3364,6 +3365,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     CodexProviderOptions["sandbox_workspace_write"]
   > | null = null;
   private resolvedSandboxPolicy: Record<string, unknown> | null = null;
+  private managedPolicyVerified = false;
   private currentThreadId: string | null = null;
   private currentTurnId: string | null = null;
   private pendingForegroundTurnIdentification: {
@@ -3593,9 +3595,46 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private rememberResolvedSandboxPolicy(response: unknown): void {
     const sandbox = toObjectRecord(toObjectRecord(response)?.sandbox);
+    if (this.requiresManagedPolicyReadback()) {
+      this.managedPolicyVerified = false;
+      if (toObjectRecord(response)?.approvalPolicy !== "never" || sandbox?.type !== "dangerFullAccess") {
+        throw new Error("Managed Codex native policy readback mismatch; executable turn refused");
+      }
+      this.managedPolicyVerified = true;
+    }
     this.resolvedSandboxPolicy = sandbox ?? null;
     if (sandbox?.type !== "workspaceWrite") return;
     this.resolvedWorkspaceWrite = readSandboxWorkspaceWrite(sandbox);
+  }
+
+  private requiresManagedPolicyReadback(): boolean {
+    return this.config.mcpServers?.itsaplan?.type === "stdio" &&
+      this.config.modeId === "full-access" &&
+      this.providerOptions.approval_policy === "never" &&
+      this.providerOptions.sandbox_mode === "danger-full-access";
+  }
+
+  private async confirmManagedTrackerStartup(): Promise<void> {
+    if (this.config.mcpServers?.itsaplan?.type !== "stdio") return;
+    if (!this.client || !this.currentThreadId) throw new Error("Managed Tracker requires initialized native thread");
+    for (let attempt = 0; attempt < 20; attempt++) {
+      let response: Record<string, unknown> | undefined;
+      try {
+        response = toObjectRecord(await this.client.request("mcpServerStatus/list", {
+          threadId: this.currentThreadId, serverName: "itsaplan",
+        }));
+      } catch {
+        throw new Error("Managed Tracker native handshake unavailable; executable turn refused");
+      }
+      const records = Array.isArray(response?.data) ? response.data : [];
+      const server = records.map(toObjectRecord).find((entry) => entry?.name === "itsaplan");
+      const tools = toObjectRecord(server?.tools);
+      if (server?.runtimeStatus === "connected" && !server.toolsError &&
+          tools?.list_projects && tools.get_issue_by_number) return;
+      if (!["notStarted", "starting"].includes(String(server?.runtimeStatus))) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error("Managed Tracker startup readback incomplete; executable turn refused");
   }
 
   private createClosedError(): Error {
@@ -3967,7 +4006,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     try {
       const loaded = toObjectRecord(await this.client.request("thread/loaded/list", {}));
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
-      if (ids.includes(this.currentThreadId)) {
+      if (ids.includes(this.currentThreadId) &&
+        (!this.requiresManagedPolicyReadback() || this.managedPolicyVerified)) {
         return;
       }
       const response = await this.client.request("thread/resume", params);
@@ -4276,6 +4316,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       } else {
         await this.ensureThread();
       }
+
+      await this.confirmManagedTrackerStartup();
 
       const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
       const turnId = this.createTurnId();
@@ -4848,6 +4890,13 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.reconcileAsyncQuestionsAfterRewind();
       },
     });
+  }
+
+  async getNativeGoal(): Promise<NativeGoalSnapshot | null> {
+    if (!this.goalsEnabled) throw new Error("Native goals unavailable in this Codex version");
+    await this.connect();
+    if (!this.client || !this.currentThreadId) return null;
+    return readNativeGoalSnapshot(this.client, this.currentThreadId);
   }
 
   async interrupt(): Promise<void> {

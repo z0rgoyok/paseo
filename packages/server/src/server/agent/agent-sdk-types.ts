@@ -1,3 +1,4 @@
+import type { NativeGoalSnapshot } from "./native-goal-readback.js";
 import type {
   AgentProviderNotice,
   AgentTaskItem,
@@ -674,6 +675,7 @@ export interface AgentSession {
   subscribe(callback: (event: AgentStreamEvent) => void): () => void;
   streamHistory(): AsyncGenerator<AgentStreamEvent>;
   getRuntimeInfo(): Promise<AgentRuntimeInfo>;
+  getNativeGoal?(): Promise<NativeGoalSnapshot | null>;
   getAvailableModes(): Promise<AgentMode[]>;
   getCurrentMode(): Promise<string | null>;
   setMode(modeId: string): Promise<void | AgentProviderNotice>;

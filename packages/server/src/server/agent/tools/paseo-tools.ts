@@ -7,6 +7,7 @@ import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-
 import type { AgentManager } from "../agent-manager.js";
 import { AgentProfileSchema } from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../../daemon-config-store.js";
+import { NativeGoalSnapshotSchema } from "../native-goal-readback.js";
 import {
   AgentFeatureSchema,
   AgentPermissionRequestPayloadSchema,
@@ -1989,6 +1990,14 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       return response;
     },
   );
+
+  registerTool("get_agent_goal", {
+    title: "Read native agent goal", description: "Read actual native goal objective, status, usage and budget.",
+    inputSchema: { agentId: z.string() }, outputSchema: { goal: NativeGoalSnapshotSchema.nullable() },
+  }, async ({ agentId }) => {
+    await ensureAgentLoaded(agentId, { agentManager, agentStorage, logger: childLogger });
+    return { content: [], structuredContent: ensureValidJson({ goal: await agentManager.getNativeGoal(agentId) }) };
+  });
 
   registerTool(
     "get_agent_status",

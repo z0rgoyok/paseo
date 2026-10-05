@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import { withRuntimeTichMcpServer } from "../runtime-tich-bootstrap.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -804,6 +805,52 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("Codex app-server provider", () => {
+  test("forwards configured context on native thread creation and preserves effort", async () => {
+    const appServer = createFakeCodexAppServer({
+      "thread/start": () => ({ thread: { id: "thread-1" }, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }),
+      "mcpServerStatus/list": () => ({ data: [{ name: "itsaplan", runtimeStatus: "connected", tools: { list_projects: {}, get_issue_by_number: {} } }] }),
+    });
+    const session = new CodexAppServerAgentSession(
+      withRuntimeTichMcpServer(createConfig({
+        thinkingOptionId: "high",
+        modeId: undefined,
+        providerOptions: { approval_policy: "on-request", sandbox_mode: "read-only" },
+      }), { PASEO_TICH_MCP_COMMAND: "/app/python", PASEO_TICH_MCP_ARGS: '["-B","/managed/tich-mcp.py"]' }),
+      null, createTestLogger(), async () => appServer.child,
+    );
+    await session.startTurn("context probe");
+    const requests = appServer.requests();
+    expect(requests.find((r) => r.method === "thread/start")?.params).toMatchObject({
+      config: { model_context_window: 1000000, model_auto_compact_token_limit: 900000, approval_policy: "never", sandbox_mode: "danger-full-access" },
+    });
+    expect(requests.find((r) => r.method === "turn/start")?.params).toMatchObject({ effort: "high", sandboxPolicy: { type: "dangerFullAccess" } });
+    appServer.completeTurn();
+    await session.close();
+    appServer.assertNoErrors();
+  });
+  test("refuses an executable turn when native full-access readback is absent", async () => {
+    const appServer = createFakeCodexAppServer();
+    const config = withRuntimeTichMcpServer(createConfig({ modeId: undefined }), {
+      PASEO_TICH_MCP_COMMAND: "/app/python", PASEO_TICH_MCP_ARGS: '["-B","/managed/tich-mcp.py"]',
+    });
+    const session = new CodexAppServerAgentSession(config, null, createTestLogger(), async () => appServer.child);
+    await expect(session.startTurn("must not execute")).rejects.toThrow("native policy readback mismatch");
+    expect(appServer.requests().some((request) => request.method === "turn/start")).toBe(false);
+    await session.close();
+  });
+  test("refuses first model turn until real Tracker MCP is connected", async () => {
+    const appServer = createFakeCodexAppServer({
+      "thread/start": () => ({ thread: { id: "thread-1" }, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }),
+      "mcpServerStatus/list": () => ({ data: [{ name: "itsaplan", runtimeStatus: "failed", tools: {} }] }),
+    });
+    const config = withRuntimeTichMcpServer(createConfig({ modeId: undefined }), {
+      PASEO_TICH_MCP_COMMAND: "/app/python", PASEO_TICH_MCP_ARGS: '["-B","/managed/tich-mcp.py"]',
+    });
+    const session = new CodexAppServerAgentSession(config, null, createTestLogger(), async () => appServer.child);
+    await expect(session.startTurn("must not execute")).rejects.toThrow("Tracker startup readback incomplete");
+    expect(appServer.requests().some((request) => request.method === "turn/start")).toBe(false);
+    await session.close();
+  });
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
     const session = createSession({}, { autoReviewEnabled: true });
 

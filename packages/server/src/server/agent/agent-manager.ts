@@ -81,6 +81,7 @@ import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
+import { withRuntimeTichMcpServer } from "./runtime-tich-bootstrap.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
 import { isPaseoToolPolicyEnabled } from "./paseo-tool-policy.js";
@@ -2303,6 +2304,12 @@ export class AgentManager {
       }
     });
     return result;
+  }
+
+  async getNativeGoal(agentId: string) {
+    const agent = this.requireSessionAgent(agentId);
+    if (!agent.session.getNativeGoal) throw new Error("Provider has no native goal capability");
+    return agent.session.getNativeGoal();
   }
 
   async runAgent(
@@ -5147,7 +5154,7 @@ export class AgentManager {
     agentId: string,
     options: { env?: Record<string, string>; purpose?: AgentResumePurpose } = {},
   ): Promise<PreparedSessionConfig> {
-    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), {
+    const storedConfig = await this.normalizeConfig(withRuntimeTichMcpServer(stripInternalPaseoMcpServer(config)), {
       env: options.env,
       purpose: options.purpose,
     });
