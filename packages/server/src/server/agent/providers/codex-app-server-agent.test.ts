@@ -851,6 +851,20 @@ describe("Codex app-server provider", () => {
     expect(appServer.requests().some((request) => request.method === "turn/start")).toBe(false);
     await session.close();
   });
+  test("accepts Codex 0.160 Tracker catalog without optional runtimeStatus", async () => {
+    const appServer = createFakeCodexAppServer({
+      "thread/start": () => ({ thread: { id: "thread-1" }, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }),
+      "mcpServerStatus/list": () => ({ data: [{ name: "itsaplan", tools: { list_projects: {}, get_issue_by_number: {} }, toolsError: null }] }),
+    });
+    const config = withRuntimeTichMcpServer(createConfig({ modeId: undefined }), {
+      PASEO_TICH_MCP_COMMAND: "/app/python", PASEO_TICH_MCP_ARGS: '["-B","/managed/tich-mcp.py"]',
+    });
+    const session = new CodexAppServerAgentSession(config, null, createTestLogger(), async () => appServer.child);
+    await session.startTurn("catalog probe");
+    expect(appServer.requests().some((request) => request.method === "turn/start")).toBe(true);
+    appServer.completeTurn();
+    await session.close();
+  });
   test("getAvailableModes includes auto-review when the Codex version supports it", async () => {
     const session = createSession({}, { autoReviewEnabled: true });
 

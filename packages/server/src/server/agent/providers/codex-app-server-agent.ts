@@ -3629,7 +3629,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const records = Array.isArray(response?.data) ? response.data : [];
       const server = records.map(toObjectRecord).find((entry) => entry?.name === "itsaplan");
       const tools = toObjectRecord(server?.tools);
-      if (server?.runtimeStatus === "connected" && !server.toolsError &&
+      if ((server?.runtimeStatus === undefined || server?.runtimeStatus === null || server?.runtimeStatus === "connected") && !server?.toolsError &&
           tools?.list_projects && tools.get_issue_by_number) return;
       if (!["notStarted", "starting"].includes(String(server?.runtimeStatus))) break;
       await new Promise((resolve) => setTimeout(resolve, 250));
